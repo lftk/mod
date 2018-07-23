@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"flag"
 	"io"
 	"log"
 	"net/http"
@@ -13,13 +13,14 @@ import (
 	"sync"
 )
 
-type verset struct {
-	sync.RWMutex
-	Versions []string
-}
+var (
+	download string
+	modules  sync.Map
+	locks    sync.Map
+)
 
-func loadGoMods(dir string) (mods sync.Map, err error) {
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+func loadGoMods() error {
+	f := func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -28,7 +29,7 @@ func loadGoMods(dir string) (mods sync.Map, err error) {
 			return nil
 		}
 
-		rel, err := filepath.Rel(dir, path)
+		rel, err := filepath.Rel(download, path)
 		if err != nil {
 			return err
 		}
@@ -46,19 +47,20 @@ func loadGoMods(dir string) (mods sync.Map, err error) {
 			return err
 		}
 
-		mods.Store(filepath.Dir(rel), &verset{Versions: vers})
+		modules.Store(strings.Replace(filepath.Dir(rel), string(filepath.Separator), "/", -1), vers)
 		return filepath.SkipDir
-	})
-	return
+	}
+	return filepath.Walk(download, f)
 }
 
-func readModList(path string) (vers []string, err error) {
+func readModList(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return
+		return nil, err
 	}
 	defer f.Close()
 
+	var vers []string
 	br := bufio.NewReader(f)
 	for {
 		var line []byte
@@ -67,96 +69,118 @@ func readModList(path string) (vers []string, err error) {
 			if err == io.EOF {
 				err = nil
 			}
-			return
+			return vers, err
 		}
 		vers = append(vers, string(line))
 	}
 }
 
-func findMod(mod, ver string) bool {
-	val, ok := modules.Load(mod)
-	if !ok {
+func hexVer(ver string) bool {
+	for i := 0; i < len(ver); i++ {
+		if c := ver[i]; '0' <= c && c <= '9' || 'a' <= c && c <= 'f' {
+			continue
+		}
 		return false
 	}
-
-	vs := val.(*verset)
-	vs.RLock()
-	defer vs.RUnlock()
-
-	for _, v := range vs.Versions {
-		if ver == v {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
-func fetchMod(mod, ver string) error {
-	err := downloadMod(mod, ver)
-	if err != nil {
-		return err
-	}
-
+func findMod(mod, ver string) (string, bool) {
 	val, ok := modules.Load(mod)
 	if !ok {
-		val, _ = modules.LoadOrStore(mod, &verset{})
+		return ver, false
 	}
 
-	vs := val.(*verset)
-	vs.Lock()
-	defer vs.Unlock()
+	b := hexVer(ver)
+	for _, v := range val.([]string) {
+		if !b {
+			if ver == v {
+				return ver, true
+			}
+			continue
+		}
 
-	for _, v := range vs.Versions {
-		if ver == v {
-			return nil
+		i := strings.LastIndex(v, "-")
+		if i == -1 {
+			continue
+		}
+
+		if strings.HasPrefix(v[i+1:], ver) {
+			return v, true
 		}
 	}
-	vs.Versions = append(vs.Versions, ver)
-	return nil
+	return ver, false
 }
 
-var modLocks sync.Map
-
-func downloadMod(mod, ver string) error {
+func fetchMod(mod, ver string) (string, error) {
 	path := mod + "@" + ver
-	val, ok := modLocks.Load(path)
+	val, ok := locks.Load(path)
 	if !ok {
-		val, _ = modLocks.LoadOrStore(path, &sync.Mutex{})
+		val, _ = locks.LoadOrStore(path, &sync.Mutex{})
 	}
 	mu := val.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
-	return exec.Command("go", "get", "-d", path).Run()
+
+	err := exec.Command("go", "get", "-d", path).Run()
+	if err != nil {
+		return "", err
+	}
+
+	vers, err := readModList(modPath(mod + "/@v/list"))
+	if err != nil {
+		return "", err
+	}
+
+	modules.Store(mod, vers)
+	val, _ = modules.LoadOrStore(mod, []string{})
+	if len(vers) != len(val.([]string)) {
+		for i := len(vers) - 1; i >= 0; i-- {
+			var found bool
+			for _, v := range val.([]string) {
+				if vers[i] == v {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return vers[i], nil
+			}
+		}
+	}
+	return ver, nil
 }
 
-func modPath(path string) string {
-	if filepath.Separator != '/' {
-		path = strings.Replace(path, "/", string(filepath.Separator), -1)
-	}
-	return filepath.Join(download, path)
+func modPath(mod string) string {
+	return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1))
 }
 
 var (
-	download string
-	modules  sync.Map
+	addr = flag.String("addr", ":6633", "mod server address")
 )
 
-func init() {
+func main() {
+	flag.Parse()
+
 	list := filepath.SplitList(os.Getenv("GOPATH"))
 	if len(list) == 0 || list[0] == "" {
 		log.Fatalf("missing $GOPATH")
 	}
 
-	var err error
 	download = filepath.Join(list[0], "src", "mod", "cache", "download")
-	modules, err = loadGoMods(download)
+	os.MkdirAll(download, 0777)
+
+	err := loadGoMods()
 	if err != nil {
 		log.Fatalf("load modules failed, err=%v", err)
 	}
-}
 
-func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+
 		path := strings.TrimLeft(r.URL.Path, "/")
 		i := strings.Index(path, "/@v/")
 		if i < 0 {
@@ -166,52 +190,36 @@ func main() {
 
 		mod, file := path[:i], path[i+len("/@v/"):]
 		if file == "list" {
-			err := downloadMod(mod, "latest")
+			_, err := fetchMod(mod, "latest")
 			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+		} else {
+			i = strings.LastIndex(file, ".")
+			if i < 0 {
 				http.NotFound(w, r)
 				return
 			}
 
-			vers, err := readModList(modPath(path))
-			if err != nil {
+			ver, ext := file[:i], file[i:]
+			if ext != ".info" && ext != ".mod" && ext != ".zip" {
 				http.NotFound(w, r)
 				return
 			}
 
-			// todo ...
-			modules.Store(mod, &verset{Versions: vers})
-
-			for _, v := range vers {
-				fmt.Fprintf(w, "%s\n", v)
+			best, ok := findMod(mod, ver)
+			if !ok {
+				ver, err := fetchMod(mod, best)
+				if err != nil {
+					http.Error(w, err.Error(), 500)
+					return
+				}
+				best = ver
 			}
-			return
+			path = mod + "/@v/" + best + ext
 		}
-
-		i = strings.LastIndex(file, ".")
-		if i < 0 {
-			http.NotFound(w, r)
-			return
-		}
-
-		ver, ext := file[:i], file[i+1:]
-		if ext != "info" && ext != "mod" && ext != "zip" {
-			http.NotFound(w, r)
-			return
-		}
-
-		if !findMod(mod, ver) && fetchMod(mod, ver) != nil {
-			http.NotFound(w, r)
-			return
-		}
-
-		f, err := os.Open(modPath(path))
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		defer f.Close()
-		_, err = io.Copy(w, f)
-		return
+		http.ServeFile(w, r, modPath(path))
 	})
 	log.Fatal(http.ListenAndServe(":6633", nil))
 }
