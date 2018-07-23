@@ -221,5 +221,5 @@ func main() {
 		}
 		http.ServeFile(w, r, modPath(path))
 	})
-	log.Fatal(http.ListenAndServe(":6633", nil))
+	log.Fatal(http.ListenAndServe(*addr, nil))
 }
