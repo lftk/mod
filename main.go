@@ -167,7 +167,7 @@ func main() {
 		log.Fatalf("missing $GOPATH")
 	}
 
-	download = filepath.Join(list[0], "src", "mod", "cache", "download")
+	download = filepath.Join(list[0], "pkg", "mod", "cache", "download")
 	os.MkdirAll(download, 0777)
 
 	err := loadGoMods()
@@ -181,6 +181,7 @@ func main() {
 			return
 		}
 
+		log.Println(r.URL.Path)
 		path := strings.TrimLeft(r.URL.Path, "/")
 		i := strings.Index(path, "/@v/")
 		if i < 0 {
