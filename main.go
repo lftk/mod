@@ -13,8 +13,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+func modPath(mod, ver, ext string) string {
+	if ver == "" {
+		return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v", ext)
+	}
+	return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v", ver) + ext
+}
 
 func readModList(mod string) ([]string, error) {
 	f, err := os.Open(modPath(mod, "", "list"))
@@ -78,6 +86,13 @@ func findMod(mod, ver string) (string, bool, error) {
 }
 
 func fetchMod(mod, ver string) (string, error) {
+	v, ok := locks.Load(mod)
+	if !ok {
+		v, _ = locks.LoadOrStore(mod, &sync.Mutex{})
+	}
+	v.(*sync.Mutex).Lock()
+	defer v.(*sync.Mutex).Unlock()
+
 	var buf bytes.Buffer
 	path := mod + "@" + ver
 	cmd := exec.Command("go", "get", "-d", path)
@@ -108,13 +123,6 @@ func fetchMod(mod, ver string) (string, error) {
 	}
 }
 
-func modPath(mod, ver, ext string) string {
-	if ver == "" {
-		return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v", ext)
-	}
-	return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v", ver) + ext
-}
-
 func httpError(w http.ResponseWriter, r *http.Request, err error) {
 	log.Println(r.URL.Path, err)
 	http.Error(w, err.Error(), 500)
@@ -122,7 +130,9 @@ func httpError(w http.ResponseWriter, r *http.Request, err error) {
 
 var (
 	download string
-	addr     = flag.String("addr", ":6633", "mod server address")
+	locks    sync.Map
+
+	addr = flag.String("addr", ":6633", "mod server address")
 )
 
 func init() {
