@@ -15,17 +15,26 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
-func modPath(mod, ver, ext string) string {
+func modPath(mod, ver, ext string) (string, error) {
+	path := filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v")
 	if ver == "" {
-		return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v", ext)
+		path = filepath.Join(path, ext)
+	} else {
+		path = filepath.Join(path, ver) + ext
 	}
-	return filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v", ver) + ext
+	return encodePath(path)
 }
 
 func readModList(mod string) ([]string, error) {
-	f, err := os.Open(modPath(mod, "", "list"))
+	path, err := modPath(mod, "", "list")
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -124,8 +133,65 @@ func fetchMod(mod, ver string) (string, error) {
 }
 
 func httpError(w http.ResponseWriter, r *http.Request, err error) {
-	log.Println(r.URL.Path, err)
 	http.Error(w, err.Error(), 500)
+	path, _ := decodePath(strings.TrimLeft(r.URL.Path, "/"))
+	log.Println(path, err)
+}
+
+func encodePath(s string) (encoding string, err error) {
+	haveUpper := false
+	for _, r := range s {
+		if r == '!' || r >= utf8.RuneSelf {
+			return "", fmt.Errorf("inconsistency")
+		}
+		if 'A' <= r && r <= 'Z' {
+			haveUpper = true
+		}
+	}
+
+	if !haveUpper {
+		return s, nil
+	}
+
+	var buf []byte
+	for _, r := range s {
+		if 'A' <= r && r <= 'Z' {
+			buf = append(buf, '!', byte(r+'a'-'A'))
+		} else {
+			buf = append(buf, byte(r))
+		}
+	}
+	return string(buf), nil
+}
+
+func decodePath(encoding string) (string, bool) {
+	var buf []byte
+	bang := false
+	for _, r := range encoding {
+		if r >= utf8.RuneSelf {
+			return "", false
+		}
+		if bang {
+			bang = false
+			if r < 'a' || 'z' < r {
+				return "", false
+			}
+			buf = append(buf, byte(r+'A'-'a'))
+			continue
+		}
+		if r == '!' {
+			bang = true
+			continue
+		}
+		if 'A' <= r && r <= 'Z' {
+			return "", false
+		}
+		buf = append(buf, byte(r))
+	}
+	if bang {
+		return "", false
+	}
+	return string(buf), true
 }
 
 var (
@@ -173,13 +239,18 @@ func main() {
 			return
 		}
 
-		path := strings.TrimLeft(r.URL.Path, "/")
+		path, ok := decodePath(strings.TrimLeft(r.URL.Path, "/"))
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
 		i := strings.Index(path, "/@v/")
 		if i < 0 {
 			http.NotFound(w, r)
 			return
 		}
-		log.Println(r.URL.Path)
+		log.Println(path)
 
 		mod, file := path[:i], path[i+len("/@v/"):]
 		if file == "list" {
@@ -188,7 +259,12 @@ func main() {
 				httpError(w, r, err)
 				return
 			}
-			http.ServeFile(w, r, modPath(mod, "", "list"))
+			path, err := modPath(mod, "", "list")
+			if err != nil {
+				httpError(w, r, err)
+				return
+			}
+			http.ServeFile(w, r, path)
 			return
 		}
 
@@ -218,7 +294,12 @@ func main() {
 			}
 		}
 
-		path = modPath(mod, best, ext)
+		path, err = modPath(mod, best, ext)
+		if err != nil {
+			httpError(w, r, err)
+			return
+		}
+
 		if _, err = os.Stat(path); err != nil {
 			if !os.IsNotExist(err) {
 				httpError(w, r, err)
