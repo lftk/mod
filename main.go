@@ -90,6 +90,9 @@ func findMod(mod, ver string) (string, bool, error) {
 		if strings.HasPrefix(v[i+1:], ver) {
 			return v, true, nil
 		}
+		if strings.HasPrefix(ver, v[i+1:]) {
+			return v, true, nil
+		}
 	}
 	return ver, false, nil
 }
@@ -127,15 +130,27 @@ func fetchMod(mod, ver string) (string, error) {
 		}
 
 		if f[1] == "downloading" && f[2] == mod {
-			return f[3], nil
+			if f[3] != ver && hexVer(ver) {
+				path, err = modPath(mod, f[3], ".info")
+				if err != nil {
+					return "", err
+				}
+				if isNotExist(path) {
+					t := time.Now()
+					ss := strings.Split(f[3], "-")
+					if len(ss) == 3 {
+						t, err = time.Parse("20060102150405", ss[1])
+						if err != nil {
+							return "", err
+						}
+					}
+					info := fmt.Sprintf(`{"Version":"%s","Time":"%s"}`, f[3], t.Format(time.RFC3339))
+					err = ioutil.WriteFile(path, []byte(info), os.ModePerm)
+				}
+			}
+			return f[3], err
 		}
 	}
-}
-
-func httpError(w http.ResponseWriter, r *http.Request, err error) {
-	http.Error(w, err.Error(), 500)
-	path, _ := decodePath(strings.TrimLeft(r.URL.Path, "/"))
-	log.Println(path, err)
 }
 
 func encodePath(s string) (encoding string, err error) {
@@ -194,6 +209,52 @@ func decodePath(encoding string) (string, bool) {
 	return string(buf), true
 }
 
+func isNotExist(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return os.IsNotExist(err)
+	}
+	return false
+}
+
+func fetchModPath(mod, ver, ext string) (string, error) {
+	if ext == "list" {
+		_, err := fetchMod(mod, "latest")
+		if err != nil {
+			return "", err
+		}
+		return modPath(mod, "", "list")
+	}
+
+	best, _, err := findMod(mod, ver)
+	if err != nil {
+		return "", err
+	}
+
+	path, err := modPath(mod, best, ext)
+	if err != nil {
+		return "", err
+	}
+
+	if isNotExist(path) {
+		best, err = fetchMod(mod, best)
+		if err != nil {
+			return "", err
+		}
+		return modPath(mod, best, ext)
+	}
+	return path, nil
+}
+
+func serveMod(w http.ResponseWriter, r *http.Request, mod, ver, ext string) {
+	log.Println(r.URL.Path)
+	path, err := fetchModPath(mod, ver, ext)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+	} else {
+		http.ServeFile(w, r, path)
+	}
+}
+
 var (
 	download string
 	locks    sync.Map
@@ -208,10 +269,8 @@ func init() {
 	}
 
 	download = filepath.Join(list[0], "pkg", "mod", "cache", "download")
-	if _, err := os.Stat(download); err != nil {
-		if os.IsNotExist(err) {
-			err = os.MkdirAll(download, os.ModePerm)
-		}
+	if isNotExist(download) {
+		err := os.MkdirAll(download, os.ModePerm)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -221,12 +280,11 @@ func init() {
 		log.Fatal(err)
 	} else {
 		path := filepath.Join(dir, "go.mod")
-		_, err = os.Stat(path)
-		if os.IsNotExist(err) {
+		if isNotExist(path) {
 			err = ioutil.WriteFile(path, []byte("module mod"), os.ModePerm)
-		}
-		if err != nil {
-			log.Fatal(err)
+			if err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 }
@@ -250,77 +308,19 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		log.Println(path)
 
 		mod, file := path[:i], path[i+len("/@v/"):]
 		if file == "list" {
-			_, err := fetchMod(mod, "latest")
-			if err != nil {
-				httpError(w, r, err)
-				return
-			}
-			path, err := modPath(mod, "", "list")
-			if err != nil {
-				httpError(w, r, err)
-				return
-			}
-			http.ServeFile(w, r, path)
+			serveMod(w, r, mod, "", file)
 			return
 		}
 
 		i = strings.LastIndex(file, ".")
-		if i < 0 {
+		if i < 0 || (file[i:] != ".info" && file[i:] != ".mod" && file[i:] != ".zip") {
 			http.NotFound(w, r)
 			return
 		}
-
-		ver, ext := file[:i], file[i:]
-		if ext != ".info" && ext != ".mod" && ext != ".zip" {
-			http.NotFound(w, r)
-			return
-		}
-
-		best, ok, err := findMod(mod, ver)
-		if err != nil {
-			httpError(w, r, err)
-			return
-		}
-
-		if !ok {
-			best, err = fetchMod(mod, ver)
-			if err != nil {
-				httpError(w, r, err)
-				return
-			}
-		}
-
-		path, err = modPath(mod, best, ext)
-		if err != nil {
-			httpError(w, r, err)
-			return
-		}
-
-		if _, err = os.Stat(path); err != nil {
-			if !os.IsNotExist(err) {
-				httpError(w, r, err)
-				return
-			}
-
-			if ext == ".info" && hexVer(ver) {
-				t := time.Now()
-				ss := strings.Split(best, "-")
-				if len(ss) == 3 {
-					t, err = time.Parse("20060102150405", ss[1])
-					if err != nil {
-						httpError(w, r, err)
-						return
-					}
-				}
-				fmt.Fprintf(w, `{"Version":"%s","Time":"%s"}`, best, t.Format(time.RFC3339))
-				return
-			}
-		}
-		http.ServeFile(w, r, path)
+		serveMod(w, r, mod, file[:i], file[i:])
 	})
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
