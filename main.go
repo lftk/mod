@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -85,9 +86,10 @@ func main() {
 }
 
 func serveMod(w http.ResponseWriter, r *http.Request, mod, ver, ext string) {
-	log.Println(r.URL.Path)
+	log.Println("[URL]", r.URL.Path)
 	path, err := fetchPath(mod, ver, ext)
 	if err != nil {
+		log.Println("[ERR]", err)
 		http.Error(w, err.Error(), 500)
 	} else {
 		http.ServeFile(w, r, path)
@@ -144,19 +146,18 @@ func fetchPath(mod, ver, ext string) (string, error) {
 	return path, nil
 }
 
-var locks sync.Map
+var fetchLock sync.Map
 
 func fetchMod(mod, ver string) error {
-	v, ok := locks.Load(mod)
+	v, ok := fetchLock.Load(mod)
 	if !ok {
-		v, _ = locks.LoadOrStore(mod, &sync.Mutex{})
+		v, _ = fetchLock.LoadOrStore(mod, &sync.Mutex{})
 	}
 	v.(*sync.Mutex).Lock()
 	defer v.(*sync.Mutex).Unlock()
 
-	path := mod + "@" + ver
-	cmd := exec.Command("go", "get", "-d", path)
-	return cmd.Run()
+	_, err := runCmd("go", "get", "-d", mod+"@"+ver)
+	return err
 }
 
 type module struct {
@@ -172,9 +173,7 @@ type module struct {
 }
 
 func modInfo(mod, ver string) (*module, error) {
-	path := mod + "@" + ver
-	cmd := exec.Command("go", "mod", "download", "-json", path)
-	b, err := cmd.CombinedOutput()
+	b, err := runCmd("go", "mod", "download", "-json", mod+"@"+ver)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +252,29 @@ func decodePath(encoding string) (string, bool) {
 		return "", false
 	}
 	return string(buf), true
+}
+
+type runError struct {
+	Cmd    string
+	Err    error
+	Stderr []byte
+}
+
+func (e *runError) Error() string {
+	text := e.Cmd + ": " + e.Err.Error()
+	stderr := bytes.TrimRight(e.Stderr, "\n")
+	if len(stderr) > 0 {
+		text += ":\n\t" + strings.Replace(string(stderr), "\n", "\n\t", -1)
+	}
+	return text
+}
+
+func runCmd(cmd ...string) ([]byte, error) {
+	b, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	if err != nil {
+		return nil, &runError{Cmd: strings.Join(cmd, " "), Err: err, Stderr: b}
+	}
+	return b, nil
 }
 
 func isExist(path string) bool {
