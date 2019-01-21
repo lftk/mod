@@ -21,11 +21,10 @@ import (
 var (
 	download string // ${GOPATH}/pkg/mod/cache/download
 	addr     = flag.String("addr", ":6633", "mod server address")
-	timeout  = flag.Duration("timeout", 20*time.Minute, "")
+	timeout  = flag.Duration("timeout", 20*time.Minute, "run go get timeout kill")
 
 	// 错误码
 	errTimeOut = errors.New("Time out") // 常见超时错误
-	errOK      = errors.New("OK")       // 该错误是被预期的正常错误
 )
 
 func init() {
@@ -162,28 +161,7 @@ func fetchMod(mod, ver string) error {
 	v.(*sync.Mutex).Lock()
 	defer v.(*sync.Mutex).Unlock()
 
-	// 增加超时处理
-	var err error
-	e := make(chan error, 1)
-
-	go func() {
-		_, errLocal := runCmd("go", "get", "-d", mod+"@"+ver)
-		if errLocal != nil {
-			e <- errLocal
-		} else {
-			e <- errOK
-		}
-		return
-	}()
-
-	select {
-	case <-time.After(*timeout):
-		err = errTimeOut
-	case err = <-e:
-		if err == errOK {
-			err = nil
-		}
-	}
+	_, err := runCmd("go", "get", "-d", mod+"@"+ver)
 	return err
 }
 
@@ -296,12 +274,30 @@ func (e *runError) Error() string {
 	return text
 }
 
-func runCmd(cmd ...string) ([]byte, error) {
-	b, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
-	if err != nil {
-		return nil, &runError{Cmd: strings.Join(cmd, " "), Err: err, Stderr: b}
+func runCmd(cmd ...string) (res []byte, err error) {
+	c := exec.Command(cmd[0], cmd[1:]...)
+
+	// 增加超时处理
+	b := make(chan bool, 1)
+	go func() {
+		res, err := c.CombinedOutput()
+		if err != nil {
+			err = &runError{Cmd: strings.Join(cmd, " "), Err: err, Stderr: res}
+		}
+		b <- true
+		return
+	}()
+
+	select {
+	case <-time.After(*timeout):
+		errLocal := c.Process.Kill()
+		if errLocal != nil {
+			log.Printf("[ERR] timeout kill %s fail\n", strings.Join(cmd, " "))
+		}
+		err = errTimeOut
+	case <-b: // waiting CombinedOutput end
 	}
-	return b, nil
+	return
 }
 
 func isExist(path string) bool {
