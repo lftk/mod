@@ -14,12 +14,18 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
 var (
 	download string // ${GOPATH}/pkg/mod/cache/download
 	addr     = flag.String("addr", ":6633", "mod server address")
+	timeout  = flag.Duration("timeout", 20*time.Minute, "")
+
+	// 错误码
+	errTimeOut = errors.New("Time out") // 常见超时错误
+	errOK      = errors.New("OK")       // 该错误是被预期的正常错误
 )
 
 func init() {
@@ -156,7 +162,28 @@ func fetchMod(mod, ver string) error {
 	v.(*sync.Mutex).Lock()
 	defer v.(*sync.Mutex).Unlock()
 
-	_, err := runCmd("go", "get", "-d", mod+"@"+ver)
+	// 增加超时处理
+	var err error
+	e := make(chan error, 1)
+
+	go func() {
+		_, errLocal := runCmd("go", "get", "-d", mod+"@"+ver)
+		if errLocal != nil {
+			e <- errLocal
+		} else {
+			e <- errOK
+		}
+		return
+	}()
+
+	select {
+	case <-time.After(*timeout):
+		err = errTimeOut
+	case err = <-e:
+		if err == errOK {
+			err = nil
+		}
+	}
 	return err
 }
 
