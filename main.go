@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"unicode/utf8"
 )
 
@@ -25,7 +24,7 @@ var (
 func init() {
 	list := filepath.SplitList(os.Getenv("GOPATH"))
 	if len(list) == 0 || list[0] == "" {
-		log.Fatalf("missing $GOPATH")
+		log.Fatal("missing $GOPATH")
 	}
 
 	download = filepath.Join(list[0], "pkg", "mod", "cache", "download")
@@ -146,16 +145,7 @@ func fetchPath(mod, ver, ext string) (string, error) {
 	return path, nil
 }
 
-var fetchLock sync.Map
-
 func fetchMod(mod, ver string) error {
-	v, ok := fetchLock.Load(mod)
-	if !ok {
-		v, _ = fetchLock.LoadOrStore(mod, &sync.Mutex{})
-	}
-	v.(*sync.Mutex).Lock()
-	defer v.(*sync.Mutex).Unlock()
-
 	_, err := runCmd("go", "get", "-d", mod+"@"+ver)
 	return err
 }
