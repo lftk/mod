@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,12 +14,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 var (
 	download string // ${GOPATH}/pkg/mod/cache/download
 	addr     = flag.String("addr", ":6633", "mod server address")
+	ttl      = flag.Duration("ttl", 2*time.Minute, "get mod time out duration")
 )
 
 func init() {
@@ -260,7 +263,9 @@ func (e *runError) Error() string {
 }
 
 func runCmd(cmd ...string) ([]byte, error) {
-	b, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), *ttl)
+	defer cancel()
+	b, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
 	if err != nil {
 		return nil, &runError{Cmd: strings.Join(cmd, " "), Err: err, Stderr: b}
 	}
