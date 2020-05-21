@@ -22,9 +22,3 @@ go get github.com/gorilla/mux@v1.6.2
 go get github.com/gorilla/mux@e3702be
 go get github.com/gorilla/mux@v0.0.0-20180517173623-c85619274f5d
 ```
-
-### Available
-
-```shell
-export GOPROXY=https://goproxy.xyz
-```
