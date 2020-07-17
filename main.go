@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -14,14 +13,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-	"unicode/utf8"
+
+	"golang.org/x/mod/module"
 )
 
 var (
 	download string // ${GOPATH}/pkg/mod/cache/download
 	addr     = flag.String("addr", ":6633", "mod server address")
-	ttl      = flag.Duration("ttl", 2*time.Minute, "get mod time out duration")
+	ttl      = flag.Duration("ttl", 3*time.Minute, "get mod timeout duration")
 )
 
 func init() {
@@ -59,41 +60,54 @@ func main() {
 			return
 		}
 
-		path, ok := decodePath(strings.TrimLeft(r.URL.Path, "/"))
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-
+		path := r.URL.Path[len("/"):]
 		i := strings.Index(path, "/@v/")
 		if i < 0 {
 			http.NotFound(w, r)
 			return
 		}
 
-		mod, file := path[:i], path[i+len("/@v/"):]
+		enc, file := path[:i], path[i+len("/@v/"):]
+		mod, err := module.UnescapePath(enc)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+
 		if file == "list" {
-			serveMod(w, r, mod, "", file)
+			serveMod(w, r, mod, "", "list")
 			return
 		}
 
 		i = strings.LastIndex(file, ".")
-		if i < 0 || (file[i:] != ".info" && file[i:] != ".mod" && file[i:] != ".zip") {
+		if i < 0 {
 			http.NotFound(w, r)
 			return
 		}
-		serveMod(w, r, mod, file[:i], file[i:])
+
+		encVers, ext := file[:i], file[i:]
+		vers, err := module.UnescapeVersion(encVers)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		if ext != ".info" && ext != ".mod" && ext != ".zip" {
+			http.NotFound(w, r)
+			return
+		}
+		serveMod(w, r, mod, vers, ext)
 	})
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 
 func serveMod(w http.ResponseWriter, r *http.Request, mod, ver, ext string) {
-	log.Println("[URL]", r.URL.Path)
 	path, err := fetchPath(mod, ver, ext)
 	if err != nil {
-		log.Println("[ERR]", err)
-		http.Error(w, err.Error(), 500)
+		log.Println("[ERR]", r.URL.Path, "->", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
+		log.Println("[OK]", r.URL.Path, "->", path)
 		http.ServeFile(w, r, path)
 	}
 }
@@ -125,12 +139,12 @@ func fetchPath(mod, ver, ext string) (string, error) {
 		return "", errors.New(m.Error)
 	}
 
-	path = map[string]string{
+	path, ok := map[string]string{
 		".info": m.Info,
 		".mod":  m.GoMod,
 		".zip":  m.Zip,
 	}[ext]
-	if strings.HasSuffix(path, ext) && isExist(path) {
+	if ok && isExist(path) {
 		return path, nil
 	}
 
@@ -148,12 +162,21 @@ func fetchPath(mod, ver, ext string) (string, error) {
 	return path, nil
 }
 
+var fetchLock sync.Map
+
 func fetchMod(mod, ver string) error {
+	v, ok := fetchLock.Load(mod)
+	if !ok {
+		v, _ = fetchLock.LoadOrStore(mod, &sync.Mutex{})
+	}
+	v.(*sync.Mutex).Lock()
+	defer v.(*sync.Mutex).Unlock()
+
 	_, err := runCmd("go", "get", "-d", mod+"@"+ver)
 	return err
 }
 
-type module struct {
+type moduleJSON struct {
 	Path     string `json:",omitempty"`
 	Version  string `json:",omitempty"`
 	Error    string `json:",omitempty"`
@@ -165,86 +188,38 @@ type module struct {
 	GoModSum string `json:",omitempty"`
 }
 
-func modInfo(mod, ver string) (*module, error) {
+func modInfo(mod, ver string) (*moduleJSON, error) {
 	b, err := runCmd("go", "mod", "download", "-json", mod+"@"+ver)
 	if err != nil {
 		return nil, err
 	}
 	for i := 0; i < len(b); i++ {
 		if b[i] == '{' {
-			var info module
-			err = json.Unmarshal(b[i:], &info)
+			var mod moduleJSON
+			err = json.Unmarshal(b[i:], &mod)
 			if err != nil {
 				return nil, err
 			}
-			return &info, nil
+			return &mod, nil
 		}
 	}
 	return nil, errors.New("unexpected")
 }
 
 func modPath(mod, ver, ext string) (string, error) {
-	path := filepath.Join(download, strings.Replace(mod, "/", string(filepath.Separator), -1), "@v")
-	if ver == "" {
-		path = filepath.Join(path, ext)
-	} else {
-		path = filepath.Join(path, ver) + ext
+	path := filepath.Join(strings.Replace(mod, "/", string(filepath.Separator), -1))
+	path, err := module.EscapePath(path)
+	if err != nil {
+		return "", err
 	}
-	return encodePath(path)
-}
-
-func encodePath(s string) (encoding string, err error) {
-	haveUpper := false
-	for _, r := range s {
-		if r == '!' || r >= utf8.RuneSelf {
-			return "", fmt.Errorf("inconsistency")
+	if ver != "" {
+		ver, err := module.EscapeVersion(ver)
+		if err != nil {
+			return "", err
 		}
-		if 'A' <= r && r <= 'Z' {
-			haveUpper = true
-		}
+		return filepath.Join(download, path, "@v", ver) + ext, nil
 	}
-	if !haveUpper {
-		return s, nil
-	}
-	var buf []byte
-	for _, r := range s {
-		if 'A' <= r && r <= 'Z' {
-			buf = append(buf, '!', byte(r+'a'-'A'))
-		} else {
-			buf = append(buf, byte(r))
-		}
-	}
-	return string(buf), nil
-}
-
-func decodePath(encoding string) (string, bool) {
-	var buf []byte
-	bang := false
-	for _, r := range encoding {
-		if r >= utf8.RuneSelf {
-			return "", false
-		}
-		if bang {
-			bang = false
-			if r < 'a' || 'z' < r {
-				return "", false
-			}
-			buf = append(buf, byte(r+'A'-'a'))
-			continue
-		}
-		if r == '!' {
-			bang = true
-			continue
-		}
-		if 'A' <= r && r <= 'Z' {
-			return "", false
-		}
-		buf = append(buf, byte(r))
-	}
-	if bang {
-		return "", false
-	}
-	return string(buf), true
+	return filepath.Join(download, path, "@v", ext), nil
 }
 
 type runError struct {
